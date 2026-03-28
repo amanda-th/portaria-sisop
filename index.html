@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Auditoria | Portaria IoT</title>
+    <style>
+        body { font-family: Arial, Helvetica, sans-serif; background-color: #e0e0e0; color: #111; margin: 0; padding: 30px; display: flex; justify-content: center; }
+        
+        .container { background-color: #ffffff; max-width: 800px; width: 100%; border: 1px solid #ccc; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        
+        .header { background-color: #723434; color: #ffffff; padding: 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #cccccc; }
+        .header h1 { margin: 0; font-size: 22px; text-transform: uppercase; letter-spacing: 1px; }
+        
+        .status-box { text-align: right; }
+        .status-text { font-size: 14px; font-weight: bold; }
+        .last-sync { font-size: 12px; color: #ffcccc; margin-top: 5px; }
+
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 15px 20px; text-align: left; border-bottom: 1px solid #eeeeee; }
+        
+        th { background-color: #f5f5f5; color: #333; font-size: 13px; text-transform: uppercase; border-bottom: 2px solid #cccccc; }
+        
+        tr:nth-child(even) { background-color: #fafafa; }
+        tr:hover { background-color: #f0f0f0; }
+        
+        .time-col { color: #3f0a0a; font-weight: bold; font-size: 14px; white-space: nowrap; }
+        .event-col { font-size: 15px; color: #222; }
+        
+        .empty-state { text-align: center; padding: 40px; color: #777; font-style: italic; background-color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <div class="header">
+            <h1>Sistema de Auditoria</h1>
+            <div class="status-box">
+                <div class="status-text">MONITORAMENTO ATIVO</div>
+                <div class="last-sync" id="last-sync">Atualizando...</div>
+            </div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th width="30%">Data / Hora</th>
+                    <th>Registro de Evento</th>
+                </tr>
+            </thead>
+            <tbody id="tabela-logs">
+                <tr><td colspan="2" class="empty-state">Buscando dados no servidor...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const DATABASE_URL = "https://portaria-rtos-default-rtdb.firebaseio.com/";
+
+        function buscarLogs() {
+            fetch(DATABASE_URL + "portaria/historico.json")
+                .then(response => response.json())
+                .then(data => {
+                    const tabela = document.getElementById('tabela-logs');
+                    tabela.innerHTML = ''; 
+                    
+                    document.getElementById('last-sync').innerText = "Última sincronização: " + new Date().toLocaleTimeString('pt-BR');
+
+                    if(data) {
+                        let eventos = Object.values(data).sort((a, b) => b.timestamp - a.timestamp);
+
+                        eventos.forEach(item => {
+                            let horaFormatada = "N/A";
+                            if(item.timestamp) {
+                                let dataLocal = new Date(item.timestamp);
+                                horaFormatada = dataLocal.toLocaleDateString('pt-BR') + ' - ' + dataLocal.toLocaleTimeString('pt-BR');
+                            }
+                            
+                            tabela.innerHTML += `
+                                <tr>
+                                    <td class="time-col">${horaFormatada}</td>
+                                    <td class="event-col">${item.evento}</td>
+                                </tr>
+                            `;
+                        });
+                    } else {
+                        tabela.innerHTML = `<tr><td colspan="2" class="empty-state">Nenhum evento registrado no sistema.</td></tr>`;
+                    }
+                })
+                .catch(error => {
+                    document.getElementById('tabela-logs').innerHTML = `<tr><td colspan="2" class="empty-state" style="color: #cc0000;">Erro de conexão com o banco de dados.</td></tr>`;
+                });
+        }
+
+        buscarLogs();
+        setInterval(buscarLogs, 3000);
+    </script>
+</body>
+</html>
