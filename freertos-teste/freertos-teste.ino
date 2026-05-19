@@ -113,6 +113,10 @@ void checarMensagens(int numNovasMensagens) {
 
 // --- A NOVA TAREFA DE REDE (NÚCLEO 0) ---
 void TarefaRede(void *pvParameters) {
+  // mensagem de inicializacao, so roda uma vez no nucleo 0
+  Serial.println("Rede: Tarefa iniciada. Mandando mensagem de boot...");
+  bot.sendMessageWithReplyKeyboard(CHAT_ID, "Portaria IoT Online!\nOs botões de controle estão no menu abaixo.", "", menuBotoes, true);
+
   for (;;) {
     // rede rodando livre
     if (millis() - ultimaChecagemTelegram > intervaloChecagem) {
@@ -251,11 +255,18 @@ void setup() {
 
   Serial.println("\nConectando ao Wi-Fi...");
   WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  while (WiFi.status() != WL_CONNECTED) { 
+    delay(500); 
+    Serial.print(".");
+  }
+
+  Serial.println("\nWi-fi conectado!");
   
   configTime(-10800, 0, "pool.ntp.org");
+  Serial.println("Relógio sincronizado com a internet!");
+
   client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-  
+
   config.host = FIREBASE_HOST;
   config.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.begin(&config, &auth);
