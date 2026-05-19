@@ -6,17 +6,10 @@
 #include <FirebaseESP32.h>
 #include "secrets.h"
 
-// --- VAR DE ESTADO E TEMPO ---
-int estadoSistema = 0;
-unsigned long cronometroEstado1 = 0; 
-const long tempoLimite = 15000;
-
-FirebaseData firebaseData;
-FirebaseConfig config;
-FirebaseAuth auth;
-
-WiFiClientSecure client;
-UniversalTelegramBot bot(BOT_TOKEN, client);
+// queue e mutex
+SemaphoreHandle_t mutexEstado;
+QueueHandle_t filaComandos;
+QueueHandle_t filaLogs;
 
 // hardware 
 Servo motorTranca;
@@ -24,26 +17,84 @@ const int pinoMotor = 12;
 const int pinoBotao = 13;
 const int pinoSensorPorta = 14;
 
-// var de estado e tempo
+// rede etc
+FirebaseData firebaseData;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+// var globais
+int estadoSistema = 0;
+unsigned long cronometroEstado1 = 0; 
+const long tempoLimite = 15000;
 unsigned long ultimaChecagemTelegram = 0;
 const long intervaloChecagem = 1000;
+String menuBotoes = "[[\"/abrir\", \"/status\"]]";
 
 // interrupção
 volatile bool campainhaAcionada = false;
 unsigned long ultimoToqueCampainha = 0;
+volatile unsigned long ultimoDebounce = 0;
 
-void IRAM_ATTR detectarCampainha() {
-  campainhaAcionada = true;
+void IRAM_ATTR detectarCampainha();
+void registrarNoFirebase(String evento);
+void checarMensagens(int numNovasMensagens);
+void TarefaRede(void *pvParameters);
+void maquinaDeEstados(int estadoIma);
+void TarefaHardware(void *pvParameters);
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(pinoBotao, INPUT_PULLUP);
+  pinMode(pinoSensorPorta, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(pinoBotao), detectarCampainha, FALLING);
+  
+  ESP32PWM::allocateTimer(1);
+  motorTranca.setPeriodHertz(50);
+  motorTranca.attach(pinoMotor, 500, 2400); 
+  motorTranca.write(0); 
+
+  Serial.println("\nConectando ao Wi-Fi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { 
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWi-fi conectado!");
+  
+  configTime(-10800, 0, "pool.ntp.org");
+  Serial.println("Relógio sincronizado com a internet!");
+
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  mutexEstado = xSemaphoreCreateMutex(); // 0
+  filaComandos = xQueueCreate(5, sizeof(int));
+  filaLogs = xQueueCreate(10, sizeof(int));
+
+  // Fixando as tarefas nos núcleos
+  xTaskCreatePinnedToCore(TarefaRede, "Rede_Telegram_Firebase", 10000, NULL, 1, NULL, 0); // Núcleo 0
+  xTaskCreatePinnedToCore(TarefaHardware, "Hardware_Porta", 10000, NULL, 1, NULL, 1);     // Núcleo 1
 }
 
-// O Nosso Cadeado do FreeRTOS
-SemaphoreHandle_t mutexEstado;
+void loop() {
+  vTaskDelete(NULL); 
+}
 
-QueueHandle_t filaComandos;
-QueueHandle_t filaLogs;
-
-// menu dos botoes do telegram
-String menuBotoes = "[[\"/abrir\", \"/status\"]]";
+void IRAM_ATTR detectarCampainha() {
+  if (millis() - ultimoDebounce > 300) {
+    campainhaAcionada = true;
+    ultimoDebounce = millis();
+  }
+}
 
 void registrarNoFirebase(String evento) {
   String caminho = "/portaria/historico";
@@ -118,6 +169,13 @@ void TarefaRede(void *pvParameters) {
   bot.sendMessageWithReplyKeyboard(CHAT_ID, "Portaria IoT Online!\nOs botões de controle estão no menu abaixo.", "", menuBotoes, true);
 
   for (;;) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("Wi-Fi caiu! Tentando reconectar...");
+      WiFi.reconnect();
+      vTaskDelay(pdMS_TO_TICKS(5000)); // espera 5s antes de tentar de novo
+      continue; // pula o resto da tarefa e volta pro começo do loop
+    }
+
     // rede rodando livre
     if (millis() - ultimaChecagemTelegram > intervaloChecagem) {
       int numNovasMensagens = bot.getUpdates(bot.last_message_received + 1);
@@ -130,91 +188,87 @@ void TarefaRede(void *pvParameters) {
     }
 
     int avisoRecebido;
-
-    if (xQueueReceive(filaLogs, &avisoRecebido, 0) == pdTRUE){
-      if (avisoRecebido == 1) { // campainha tocada
-        Serial.println("Rede: Enviando alerta de campainha tocada...");
-        bot.sendMessageWithReplyKeyboard(CHAT_ID, "Campainha acionada!...", "", menuBotoes, true);
-        registrarNoFirebase("Campainha Tocada");
-
+    if (xQueueReceive(filaLogs, &avisoRecebido, 0) == pdTRUE) {
+      switch (avisoRecebido) {
+        case 1: // Campainha
+          Serial.println("Rede: Enviando alerta de campainha tocada...");
+          bot.sendMessageWithReplyKeyboard(CHAT_ID, "Campainha acionada!...", "", menuBotoes, true);
+          registrarNoFirebase("Campainha Tocada");
+          break;
+        case 2: // Abertura Física
+          Serial.println("Rede: Registrando abertura física...");
+          registrarNoFirebase("Porta Aberta (Sensor)");
+          break;
+        case 3: // Timeout
+          Serial.println("Rede: Enviando alertas de Timeout...");
+          bot.sendMessage(CHAT_ID, "O visitante não abriu a porta a tempo. Trancada novamente.", "");
+          registrarNoFirebase("Acesso Negado (Timeout)");
+          break;
+        case 4: // Porta Fechada
+          Serial.println("Rede: Enviando alerta de porta fechada...");
+          bot.sendMessage(CHAT_ID, "O visitante entrou. Porta fechada e trancada com sucesso.", "");
+          registrarNoFirebase("Porta Fechada e Trancada");
+          break;
       }
-      else if (avisoRecebido == 2) { // porta aberta sensor
-        Serial.println("Rede: Registrando abertura física...");
-        registrarNoFirebase("Porta Aberta (Sensor)");
-      }
-      else if (avisoRecebido == 3) { // timeout
-         Serial.println("Rede: Enviando alertas de Timeout...");
-         bot.sendMessage(CHAT_ID, "O visitante não abriu a porta a tempo. Trancada novamente.", "");
-         registrarNoFirebase("Acesso Negado (Timeout)");
-      }
-      else if (avisoRecebido == 4) { // porta fechada
-        Serial.println("Rede: Enviando alerta de porta fechada...");
-        bot.sendMessage(CHAT_ID, "O visitante entrou. Porta fechada e trancada com sucesso.", "");
-        registrarNoFirebase("Porta Fechada e Trancada");
-      }   
     }
     vTaskDelay(pdMS_TO_TICKS(100)); 
   }
 }
 
-void maquinaDeEstados (int estadoIma){
-  if (estadoSistema == 0 && campainhaAcionada) {
-    if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE){
-      campainhaAcionada = false;
-      
-      if (millis() - ultimoToqueCampainha > 5000) { 
-        Serial.println("Campainha acionada! Notificando proprietária...");
-
-        int aviso = 1;
-        xQueueSend(filaLogs, &aviso, 0);
-        ultimoToqueCampainha = millis();
+// boom boom chk chk boom e tals
+void maquinaDeEstados(int estadoIma) {
+  switch (estadoSistema) {
+    
+    case 0: // TRANCADA
+      if (campainhaAcionada) {
+        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
+          campainhaAcionada = false;
+          if (millis() - ultimoToqueCampainha > 5000) { 
+            Serial.println("Campainha acionada! Notificando proprietária...");
+            int aviso = 1;
+            xQueueSend(filaLogs, &aviso, 0);
+            ultimoToqueCampainha = millis();
+          }
+          xSemaphoreGive(mutexEstado);
+        }
       }
-      xSemaphoreGive(mutexEstado);
-    }
-  }
-  
-  // estado 1: porta foi destrancada pelo celular
-  if (estadoSistema == 1) {
-    if (estadoIma == HIGH) { 
-      if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
-        Serial.println("Sensor: Porta foi aberta pelo visitante.");
-        estadoSistema = 2;
-        
-        int aviso = 2;
-        xQueueSend(filaLogs, &aviso, 0);
+      break;
 
-        xSemaphoreGive(mutexEstado);
-        delay(500);
+    case 1: // DESTRANCADA
+      if (estadoIma == HIGH) { 
+        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
+          Serial.println("Sensor: Porta foi aberta pelo visitante.");
+          estadoSistema = 2;
+          int aviso = 2;
+          xQueueSend(filaLogs, &aviso, 0);
+          xSemaphoreGive(mutexEstado);
+          vTaskDelay(pdMS_TO_TICKS(500));
+        }
+      } else if (millis() - cronometroEstado1 > tempoLimite) {
+        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
+          Serial.println("TIMEOUT! Trancando por segurança...");
+          motorTranca.write(0);
+          estadoSistema = 0;
+          int aviso = 3;
+          xQueueSend(filaLogs, &aviso, 0);
+          xSemaphoreGive(mutexEstado);
+        }
       }
-    } 
-    else if (millis() - cronometroEstado1 > tempoLimite) {
-      if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
-        Serial.println("TIMEOUT! Trancando por segurança...");
-        motorTranca.write(0);
-        estadoSistema = 0;
+      break;
 
-        //avisa nucleo 0 >>hardware nao envia msg!!<<
-        int aviso = 3;
-        xQueueSend(filaLogs, &aviso, 0);
-
-        xSemaphoreGive(mutexEstado);
+    case 2: // ABERTA
+      if (estadoIma == LOW) {
+        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
+          Serial.println("Sensor: Porta encostada. Trancando...");
+          motorTranca.write(0); 
+          estadoSistema = 0;
+          int aviso = 4;
+          xQueueSend(filaLogs, &aviso, 0);
+          xSemaphoreGive(mutexEstado);
+          vTaskDelay(pdMS_TO_TICKS(500));
+        }
       }
-    }
-  }
-  
-  // estado 2: porta tava aberta e agora foi encostada
-  if (estadoSistema == 2 && estadoIma == LOW) {
-    if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
-      Serial.println("Sensor: Porta encostada. Trancando...");
-      motorTranca.write(0); 
-      estadoSistema = 0;
-
-      int aviso = 4;
-      xQueueSend(filaLogs, &aviso, 0);
-
-      xSemaphoreGive(mutexEstado);
-      delay(500);
-    }
+      break;
   }
 }
 
@@ -240,48 +294,3 @@ void TarefaHardware(void *pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(50)); 
   }
 }
-
-void setup() {
-  Serial.begin(115200);
-
-  pinMode(pinoBotao, INPUT_PULLUP);
-  pinMode(pinoSensorPorta, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(pinoBotao), detectarCampainha, FALLING);
-  
-  ESP32PWM::allocateTimer(1);
-  motorTranca.setPeriodHertz(50);
-  motorTranca.attach(pinoMotor, 500, 2400); 
-  motorTranca.write(0); 
-
-  Serial.println("\nConectando ao Wi-Fi...");
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) { 
-    delay(500); 
-    Serial.print(".");
-  }
-
-  Serial.println("\nWi-fi conectado!");
-  
-  configTime(-10800, 0, "pool.ntp.org");
-  Serial.println("Relógio sincronizado com a internet!");
-
-  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
-
-  config.host = FIREBASE_HOST;
-  config.signer.tokens.legacy_token = FIREBASE_AUTH;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-
-  mutexEstado = xSemaphoreCreateMutex(); // 0
-  filaComandos = xQueueCreate(5, sizeof(int));
-  filaLogs = xQueueCreate(10, sizeof(int));
-
-  // Fixando as tarefas nos núcleos
-  xTaskCreatePinnedToCore(TarefaRede, "Rede_Telegram_Firebase", 10000, NULL, 1, NULL, 0); // Núcleo 0
-  xTaskCreatePinnedToCore(TarefaHardware, "Hardware_Porta", 10000, NULL, 1, NULL, 1);     // Núcleo 1
-}
-
-void loop() {
-  vTaskDelete(NULL); 
-}
-
