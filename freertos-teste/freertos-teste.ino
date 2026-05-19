@@ -26,12 +26,27 @@ WiFiClientSecure client;
 UniversalTelegramBot bot(BOT_TOKEN, client);
 
 // var globais
-int estadoSistema = 0;
+enum EstadoPorta {
+  TRANCADA = 0,
+  DESTRANCADA = 1,
+  ABERTA = 2
+};
+
+EstadoPorta estadoSistema = TRANCADA; // inicia a var ja trancada
+
+enum TipoAviso {
+  NENHUM = 0,
+  AVISO_CAMPAINHA = 1,
+  AVISO_PORTA_ABERTA = 2,
+  AVISO_TIMEOUT = 3,
+  AVISO_PORTA_FECHADA = 4
+};
+
 unsigned long cronometroEstado1 = 0; 
 const long tempoLimite = 15000;
 unsigned long ultimaChecagemTelegram = 0;
 const long intervaloChecagem = 1000;
-String menuBotoes = "[[\"/abrir\", \"/status\"]]";
+const char* menuBotoes = "[[\"/abrir\", \"/status\"]]";
 
 // interrupção
 volatile bool campainhaAcionada = false;
@@ -123,24 +138,22 @@ void checarMensagens(int numNovasMensagens) {
 
     if (chat_id != CHAT_ID) continue;
 
-    if (texto == "/abrir") {
-      int podeAbrir = 0;
-      // tentar implementar queue i guess
-      if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
-        if (estadoSistema == 0) {
-          podeAbrir = 1;
-        }
-        xSemaphoreGive(mutexEstado); // devolve
-      }
+    int estadoAtual = -1;
+    
+    if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
+      estadoAtual = estadoSistema;
+      xSemaphoreGive(mutexEstado);
+    }
 
-      if (podeAbrir){
+    if (texto == "/abrir") {
+      if (estadoAtual == TRANCADA) { 
         Serial.println("Comando remoto recebido. Destrancando...");
         bot.sendMessage(chat_id, "Acesso autorizado! Destrancando a porta...", "");
           
-        int comando = 1; // cod pra abrir a porta
-        xQueueSend (filaComandos, &comando, 0);
+        int comando = 1; // código interno para a fila de comando
+        xQueueSend(filaComandos, &comando, 0);
 
-        vTaskDelay (pdMS_TO_TICKS(800)); // delay no nucleo de rede pro motor terminar o movimento e aenergia do usb estabilizar
+        vTaskDelay(pdMS_TO_TICKS(800)); // delay pra evitar brownout
 
         registrarNoFirebase("Acesso autorizado (Telegram)");
       } else {
@@ -148,16 +161,17 @@ void checarMensagens(int numNovasMensagens) {
       }
     }
 
+    // --- COMANDO /STATUS ---
     else if (texto == "/status") {
-      int estadoTemporario = 0;
-      // sera de aqui ser um semaforo tambem?
-      if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE){
-        estadoTemporario = estadoSistema;
-        xSemaphoreGive(mutexEstado);
+      if (estadoAtual == TRANCADA) {
+        bot.sendMessage(chat_id, "Status: Trancada 🔒", "");
+      } 
+      else if (estadoAtual == DESTRANCADA) {
+        bot.sendMessage(chat_id, "Status: Destrancada 🔓 (Aguardando visitante abrir a porta)", "");
+      } 
+      else if (estadoAtual == ABERTA) {
+        bot.sendMessage(chat_id, "Status: Aberta 🚪", "");
       }
-      if (estadoTemporario == 0) bot.sendMessage(chat_id, "Status: Trancada", "");
-      else if (estadoTemporario == 1) bot.sendMessage(chat_id, "Status: Destrancada (Aguardando visitante)", "");
-      else bot.sendMessage(chat_id, "Status: Aberta", "");
     }
   }
 }
@@ -190,21 +204,21 @@ void TarefaRede(void *pvParameters) {
     int avisoRecebido;
     if (xQueueReceive(filaLogs, &avisoRecebido, 0) == pdTRUE) {
       switch (avisoRecebido) {
-        case 1: // Campainha
+        case AVISO_CAMPAINHA:
           Serial.println("Rede: Enviando alerta de campainha tocada...");
           bot.sendMessageWithReplyKeyboard(CHAT_ID, "Campainha acionada!...", "", menuBotoes, true);
           registrarNoFirebase("Campainha Tocada");
           break;
-        case 2: // Abertura Física
+        case AVISO_PORTA_ABERTA:
           Serial.println("Rede: Registrando abertura física...");
           registrarNoFirebase("Porta Aberta (Sensor)");
           break;
-        case 3: // Timeout
+        case AVISO_TIMEOUT:
           Serial.println("Rede: Enviando alertas de Timeout...");
           bot.sendMessage(CHAT_ID, "O visitante não abriu a porta a tempo. Trancada novamente.", "");
           registrarNoFirebase("Acesso Negado (Timeout)");
           break;
-        case 4: // Porta Fechada
+        case AVISO_PORTA_FECHADA:
           Serial.println("Rede: Enviando alerta de porta fechada...");
           bot.sendMessage(CHAT_ID, "O visitante entrou. Porta fechada e trancada com sucesso.", "");
           registrarNoFirebase("Porta Fechada e Trancada");
@@ -217,16 +231,18 @@ void TarefaRede(void *pvParameters) {
 
 // boom boom chk chk boom e tals
 void maquinaDeEstados(int estadoIma) {
+  TipoAviso aviso = NENHUM;       // var unica p salvar o babado
+  bool pausar = false; // flag pro delay
+
   switch (estadoSistema) {
     
-    case 0: // TRANCADA
+    case TRANCADA:
       if (campainhaAcionada) {
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
           campainhaAcionada = false;
           if (millis() - ultimoToqueCampainha > 5000) { 
             Serial.println("Campainha acionada! Notificando proprietária...");
-            int aviso = 1;
-            xQueueSend(filaLogs, &aviso, 0);
+            aviso = AVISO_CAMPAINHA; // só anota n envia nd
             ultimoToqueCampainha = millis();
           }
           xSemaphoreGive(mutexEstado);
@@ -234,63 +250,69 @@ void maquinaDeEstados(int estadoIma) {
       }
       break;
 
-    case 1: // DESTRANCADA
+    case DESTRANCADA:
       if (estadoIma == HIGH) { 
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
           Serial.println("Sensor: Porta foi aberta pelo visitante.");
-          estadoSistema = 2;
-          int aviso = 2;
-          xQueueSend(filaLogs, &aviso, 0);
+          estadoSistema = ABERTA;
+          aviso = AVISO_PORTA_ABERTA;
           xSemaphoreGive(mutexEstado);
-          vTaskDelay(pdMS_TO_TICKS(500));
+          pausar = true;
         }
       } else if (millis() - cronometroEstado1 > tempoLimite) {
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
           Serial.println("TIMEOUT! Trancando por segurança...");
           motorTranca.write(0);
-          estadoSistema = 0;
-          int aviso = 3;
-          xQueueSend(filaLogs, &aviso, 0);
+          estadoSistema = TRANCADA;
+          aviso = AVISO_TIMEOUT;
           xSemaphoreGive(mutexEstado);
         }
       }
       break;
 
-    case 2: // ABERTA
+    case ABERTA:
       if (estadoIma == LOW) {
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
           Serial.println("Sensor: Porta encostada. Trancando...");
           motorTranca.write(0); 
-          estadoSistema = 0;
-          int aviso = 4;
-          xQueueSend(filaLogs, &aviso, 0);
+          estadoSistema = TRANCADA;
+          aviso = AVISO_PORTA_FECHADA;
           xSemaphoreGive(mutexEstado);
-          vTaskDelay(pdMS_TO_TICKS(500));
+          pausar = true;
         }
       }
       break;
   }
+
+  // se algum dos cases gerou um aviso envia pra fila
+  if (aviso != NENHUM) {
+    int valorParaFila = aviso;
+    xQueueSend(filaLogs, &valorParaFila, 0);
+  }
+
+  // se algum case pediu pausa aplica o delay aqui
+  if (pausar) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
 }
 
+// bixa louca mds apaguei sem querer a funcao
 void TarefaHardware(void *pvParameters) {
   for (;;) {
     int comandoRecebido;
-
-    if (xQueueReceive(filaComandos, &comandoRecebido, 0) == pdTRUE ){
-      // se recebeu 1 (abrir), e a porta ta trancada, executa
-      if (comandoRecebido == 1 && estadoSistema == 0){
-        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
+    if (xQueueReceive(filaComandos, &comandoRecebido, 0) == pdTRUE) { // ve se tem algo na fila
+      if (comandoRecebido == 1 && xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { // se for o comando de abrir pega
+        if (estadoSistema == TRANCADA) {
           Serial.println("Hardware: Destrancando...");
           motorTranca.write(90);
-          estadoSistema = 1;
+          estadoSistema = DESTRANCADA;
           cronometroEstado1 = millis();
-          xSemaphoreGive(mutexEstado);
         }
+        xSemaphoreGive(mutexEstado); // devolva
       }
     }  
-
     int estadoIma = digitalRead(pinoSensorPorta);
-    maquinaDeEstados (estadoIma);
-    vTaskDelay(pdMS_TO_TICKS(50)); 
+    maquinaDeEstados(estadoIma);
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
