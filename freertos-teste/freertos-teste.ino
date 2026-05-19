@@ -36,6 +36,7 @@ unsigned long ultimoToqueCampainha = 0;
 SemaphoreHandle_t mutexEstado;
 
 QueueHandle_t filaComandos;
+QueueHandle_t filaLogs;
 
 // menu dos botoes do telegram
 String menuBotoes = "[[\"/abrir\", \"/status\"]]";
@@ -68,21 +69,27 @@ void checarMensagens(int numNovasMensagens) {
     if (chat_id != CHAT_ID) continue;
 
     if (texto == "/abrir") {
+      bool podeAbrir = false;
+      // tentar implementar queue i guess
       if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
-        
         if (estadoSistema == 0) {
-          Serial.println("Comando remoto recebido. Destrancando...");
-          bot.sendMessage(chat_id, "Acesso autorizado! Destrancando a porta...", "");
-          
-          motorTranca.write(90); 
-          estadoSistema = 1; 
-          cronometroEstado1 = millis();
-          
-          registrarNoFirebase("Acesso Autorizado (Telegram)");
-        } else {
-          bot.sendMessage(chat_id, "A porta já está destrancada ou aberta.", "");
+          podeAbrir = true;
         }
-        xSemaphoreGive(mutexEstado);
+        xSemaphoreGive(mutexEstado); // devolve
+      }
+
+      if (podeAbrir){
+        Serial.println("Comando remoto recebido. Destrancando...");
+        bot.sendMessage(chat_id, "Acesso autorizado! Destrancando a porta...", "");
+          
+        int comando = 1; // cod pra abrir a porta
+
+        // 0 -> nao espera
+        xQueueSend (filaComandos, &comando, 0);
+
+        registrarNoFirebase("Acesso autorizado (Telegram)");
+      } else {
+        bot.sendMessage(chat_id, "A porta já está destrancada ou aberta.", "");
       }
     }
 
@@ -112,7 +119,31 @@ void TarefaRede(void *pvParameters) {
       }
       ultimaChecagemTelegram = millis();
     }
-    
+
+    int avisoRecebido;
+
+    if (xQueueReceive(filaLogs, &avisoRecebido, 0) == pdTRUE){
+      if (avisoRecebido == 1) { // campainha tocada
+        Serial.println("Rede: Enviando alerta de campainha tocada...");
+        bot.sendMessageWithReplyKeyboard(CHAT_ID, "Campainha acionada!...", "", menuBotoes, true);
+        registrarNoFirebase("Campainha Tocada");
+
+      }
+      else if (avisoRecebido == 2) { // porta aberta sensor
+        Serial.println("Rede: Registrando abertura física...");
+        registrarNoFirebase("Porta Aberta (Sensor)");
+      }
+      else if (avisoRecebido == 3) { // timeout
+         Serial.println("Rede: Enviando alertas de Timeout...");
+         bot.sendMessage(CHAT_ID, "O visitante não abriu a porta a tempo. Trancada novamente.", "");
+         registrarNoFirebase("Acesso Negado (Timeout)");
+      }
+      else if (avisoRecebido == 4) { // porta fechada
+        Serial.println("Rede: Enviando alerta de porta fechada...");
+        bot.sendMessage(CHAT_ID, "O visitante entrou. Porta fechada e trancada com sucesso.", "");
+        registrarNoFirebase("Porta Fechada e Trancada");
+      }   
+    }
     vTaskDelay(pdMS_TO_TICKS(100)); 
   }
 }
@@ -124,11 +155,11 @@ void maquinaDeEstados (int estadoIma){
       
       if (millis() - ultimoToqueCampainha > 5000) { 
         Serial.println("Campainha acionada! Notificando proprietária...");
-        bot.sendMessageWithReplyKeyboard(CHAT_ID, "🔔 Campainha acionada!...", "", menuBotoes, true);
-        registrarNoFirebase("Campainha Tocada");
+
+        int aviso = 1;
+        xQueueSend(filaLogs, &aviso, 0);
         ultimoToqueCampainha = millis();
       }
-      
       xSemaphoreGive(mutexEstado);
     }
   }
@@ -140,10 +171,10 @@ void maquinaDeEstados (int estadoIma){
         Serial.println("Sensor: Porta foi aberta pelo visitante.");
         estadoSistema = 2;
         
-        // gatilho firebase
-        registrarNoFirebase("Porta Aberta (Sensor)");
-        xSemaphoreGive(mutexEstado);
+        int aviso = 2;
+        xQueueSend(filaLogs, &aviso, 0);
 
+        xSemaphoreGive(mutexEstado);
         delay(500);
       }
     } 
@@ -152,10 +183,11 @@ void maquinaDeEstados (int estadoIma){
         Serial.println("TIMEOUT! Trancando por segurança...");
         motorTranca.write(0);
         estadoSistema = 0;
-        bot.sendMessage(CHAT_ID, "[!] O visitante não abriu a porta a tempo. Trancada novamente por segurança.", "");
-          
-        // gatilho firebase
-        registrarNoFirebase("Acesso Negado (Timeout)");
+
+        //avisa nucleo 0 >>hardware nao envia msg!!<<
+        int aviso = 3;
+        xQueueSend(filaLogs, &aviso, 0);
+
         xSemaphoreGive(mutexEstado);
       }
     }
@@ -167,12 +199,11 @@ void maquinaDeEstados (int estadoIma){
       Serial.println("Sensor: Porta encostada. Trancando...");
       motorTranca.write(0); 
       estadoSistema = 0;
-      bot.sendMessage(CHAT_ID, "O visitante entrou. Porta fechada e trancada com sucesso.", "");
-      
-      // gatilho firebase
-      registrarNoFirebase("Porta Fechada e Trancada");
-      xSemaphoreGive(mutexEstado);
 
+      int aviso = 4;
+      xQueueSend(filaLogs, &aviso, 0);
+
+      xSemaphoreGive(mutexEstado);
       delay(500);
     }
   }
@@ -180,7 +211,21 @@ void maquinaDeEstados (int estadoIma){
 
 void TarefaHardware(void *pvParameters) {
   for (;;) {
-    // 2. le sensor da porta
+    int comandoRecebido;
+
+    if (xQueueReceive(filaComandos, &comandoRecebido, 0) == pdTRUE ){
+      // se recebeu 1 (abrir), e a porta ta trancada, executa
+      if (comandoRecebido == 1 && estadoSistema == 0){
+        if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
+          Serial.println("Hardware: Destrancando...");
+          motorTranca.write(90);
+          estadoSistema = 1;
+          cronometroEstado1 = millis();
+          xSemaphoreGive(mutexEstado);
+        }
+      }
+    }  
+
     int estadoIma = digitalRead(pinoSensorPorta);
     maquinaDeEstados (estadoIma);
     vTaskDelay(pdMS_TO_TICKS(50)); 
@@ -192,6 +237,7 @@ void setup() {
   mutexEstado = xSemaphoreCreateMutex(); // 0
 
   filaComandos = xQueueCreate(5, sizeof(int)); // Fila para 5 comandos
+  filaLogs = xQueueCreate(10, sizeof(int));
 
   // Fixando as tarefas nos núcleos
   xTaskCreatePinnedToCore(TarefaRede, "Rede_Telegram_Firebase", 10000, NULL, 1, NULL, 0); // Núcleo 0
