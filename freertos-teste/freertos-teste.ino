@@ -32,6 +32,10 @@ const long intervaloChecagem = 1000;
 volatile bool campainhaAcionada = false;
 unsigned long ultimoToqueCampainha = 0;
 
+void IRAM_ATTR detectarCampainha() {
+  campainhaAcionada = true;
+}
+
 // O Nosso Cadeado do FreeRTOS
 SemaphoreHandle_t mutexEstado;
 
@@ -69,11 +73,11 @@ void checarMensagens(int numNovasMensagens) {
     if (chat_id != CHAT_ID) continue;
 
     if (texto == "/abrir") {
-      bool podeAbrir = false;
+      int podeAbrir = 0;
       // tentar implementar queue i guess
       if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) {
         if (estadoSistema == 0) {
-          podeAbrir = true;
+          podeAbrir = 1;
         }
         xSemaphoreGive(mutexEstado); // devolve
       }
@@ -83,9 +87,9 @@ void checarMensagens(int numNovasMensagens) {
         bot.sendMessage(chat_id, "Acesso autorizado! Destrancando a porta...", "");
           
         int comando = 1; // cod pra abrir a porta
-
-        // 0 -> nao espera
         xQueueSend (filaComandos, &comando, 0);
+
+        vTaskDelay (pdMS_TO_TICKS(800)); // delay no nucleo de rede pro motor terminar o movimento e aenergia do usb estabilizar
 
         registrarNoFirebase("Acesso autorizado (Telegram)");
       } else {
@@ -94,14 +98,15 @@ void checarMensagens(int numNovasMensagens) {
     }
 
     else if (texto == "/status") {
+      int estadoTemporario = 0;
       // sera de aqui ser um semaforo tambem?
       if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE){
-        if (estadoSistema == 0) bot.sendMessage(chat_id, "Status: Trancada", "");
-        else if (estadoSistema == 1) bot.sendMessage(chat_id, "Status: Destrancada (Aguardando visitante abrir a maçaneta)", "");
-        else bot.sendMessage(chat_id, "Status: Aberta", "");
-
+        estadoTemporario = estadoSistema;
         xSemaphoreGive(mutexEstado);
       }
+      if (estadoTemporario == 0) bot.sendMessage(chat_id, "Status: Trancada", "");
+      else if (estadoTemporario == 1) bot.sendMessage(chat_id, "Status: Destrancada (Aguardando visitante)", "");
+      else bot.sendMessage(chat_id, "Status: Aberta", "");
     }
   }
 }
@@ -234,9 +239,30 @@ void TarefaHardware(void *pvParameters) {
 
 void setup() {
   Serial.begin(115200);
-  mutexEstado = xSemaphoreCreateMutex(); // 0
 
-  filaComandos = xQueueCreate(5, sizeof(int)); // Fila para 5 comandos
+  pinMode(pinoBotao, INPUT_PULLUP);
+  pinMode(pinoSensorPorta, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(pinoBotao), detectarCampainha, FALLING);
+  
+  ESP32PWM::allocateTimer(1);
+  motorTranca.setPeriodHertz(50);
+  motorTranca.attach(pinoMotor, 500, 2400); 
+  motorTranca.write(0); 
+
+  Serial.println("\nConectando ao Wi-Fi...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  configTime(-10800, 0, "pool.ntp.org");
+  client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+  
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  mutexEstado = xSemaphoreCreateMutex(); // 0
+  filaComandos = xQueueCreate(5, sizeof(int));
   filaLogs = xQueueCreate(10, sizeof(int));
 
   // Fixando as tarefas nos núcleos
