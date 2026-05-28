@@ -57,6 +57,7 @@ void IRAM_ATTR detectarCampainha();
 void registrarNoFirebase(String evento);
 void checarMensagens(int numNovasMensagens);
 void TarefaRede(void *pvParameters);
+void moverMotorSuavemente(int anguloDestino);
 void maquinaDeEstados(int estadoIma);
 void TarefaHardware(void *pvParameters);
 
@@ -176,7 +177,7 @@ void checarMensagens(int numNovasMensagens) {
   }
 }
 
-// --- A NOVA TAREFA DE REDE (NÚCLEO 0) ---
+// --- A TAREFA DE REDE (NÚCLEO 0) ---
 void TarefaRede(void *pvParameters) {
   // mensagem de inicializacao, so roda uma vez no nucleo 0
   Serial.println("Rede: Tarefa iniciada. Mandando mensagem de boot...");
@@ -229,7 +230,25 @@ void TarefaRede(void *pvParameters) {
   }
 }
 
-// boom boom chk chk boom e tals
+// func pra tentar evitar o erro de brownout detector
+void moverMotorSuavemente(int anguloDestino) {
+  int anguloAtual = motorTranca.read(); // lê onde a tranca está agora
+
+  if (anguloAtual < anguloDestino) {
+    // se precisa ir pra frente (ex: 0 para 90)
+    for (int pos = anguloAtual; pos <= anguloDestino; pos++) {
+      motorTranca.write(pos);
+      vTaskDelay(pdMS_TO_TICKS(5)); // ajustar esse num se necessario dps
+    }
+  } else {
+    // se precisa voltar (ex: 90 para 0)
+    for (int pos = anguloAtual; pos >= anguloDestino; pos--) {
+      motorTranca.write(pos);
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+}
+
 void maquinaDeEstados(int estadoIma) {
   TipoAviso aviso = NENHUM;       // var unica p salvar o babado
   bool pausar = false; // flag pro delay
@@ -262,7 +281,7 @@ void maquinaDeEstados(int estadoIma) {
       } else if (millis() - cronometroEstado1 > tempoLimite) {
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
           Serial.println("TIMEOUT! Trancando por segurança...");
-          motorTranca.write(0);
+          moverMotorSuavemente(0);
           estadoSistema = TRANCADA;
           aviso = AVISO_TIMEOUT;
           xSemaphoreGive(mutexEstado);
@@ -274,7 +293,7 @@ void maquinaDeEstados(int estadoIma) {
       if (estadoIma == LOW) {
         if (xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { 
           Serial.println("Sensor: Porta encostada. Trancando...");
-          motorTranca.write(0); 
+          moverMotorSuavemente(0); 
           estadoSistema = TRANCADA;
           aviso = AVISO_PORTA_FECHADA;
           xSemaphoreGive(mutexEstado);
@@ -304,11 +323,11 @@ void TarefaHardware(void *pvParameters) {
       if (comandoRecebido == 1 && xSemaphoreTake(mutexEstado, portMAX_DELAY) == pdTRUE) { // se for o comando de abrir pega
         if (estadoSistema == TRANCADA) {
           Serial.println("Hardware: Destrancando...");
-          motorTranca.write(90);
+          moverMotorSuavemente(90); // abre
           estadoSistema = DESTRANCADA;
           cronometroEstado1 = millis();
         }
-        xSemaphoreGive(mutexEstado); // devolva
+        xSemaphoreGive(mutexEstado); // devolve
       }
     }  
     int estadoIma = digitalRead(pinoSensorPorta);
