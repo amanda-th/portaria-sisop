@@ -71,7 +71,7 @@ void setup() {
   ESP32PWM::allocateTimer(1);
   motorTranca.setPeriodHertz(50);
   motorTranca.attach(pinoMotor, 500, 2400); 
-  motorTranca.write(0); 
+  motorTranca.write(0);
 
   Serial.println("\nConectando ao Wi-Fi...");
   WiFi.begin(ssid, password);
@@ -232,6 +232,9 @@ void TarefaRede(void *pvParameters) {
 
 // func pra tentar evitar o erro de brownout detector
 void moverMotorSuavemente(int anguloDestino) {
+  // bora acordar
+  motorTranca.attach(pinoMotor, 500, 2400);
+
   int anguloAtual = motorTranca.read(); 
   int tamanhoDoPasso = 5; // aumentar aki pra deixar + rapido
 
