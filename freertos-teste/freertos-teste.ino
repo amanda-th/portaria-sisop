@@ -232,20 +232,24 @@ void TarefaRede(void *pvParameters) {
 
 // func pra tentar evitar o erro de brownout detector
 void moverMotorSuavemente(int anguloDestino) {
-  int anguloAtual = motorTranca.read(); // lê onde a tranca está agora
+  int anguloAtual = motorTranca.read(); 
+  int tamanhoDoPasso = 5; // aumentar aki pra deixar + rapido
 
   if (anguloAtual < anguloDestino) {
-    // se precisa ir pra frente (ex: 0 para 90)
-    for (int pos = anguloAtual; pos <= anguloDestino; pos++) {
+    // indo para frente (ex: 0 para 90), pulando de 5 em 5 graus
+    for (int pos = anguloAtual; pos <= anguloDestino; pos += tamanhoDoPasso) {
       motorTranca.write(pos);
-      vTaskDelay(pdMS_TO_TICKS(5)); // ajustar esse num se necessario dps
+      vTaskDelay(pdMS_TO_TICKS(15)); // manter o delay em 15 ou 10
     }
+    motorTranca.write(anguloDestino); 
+
   } else {
-    // se precisa voltar (ex: 90 para 0)
-    for (int pos = anguloAtual; pos >= anguloDestino; pos--) {
+    // voltando (ex: 90 para 0), descendo de 5 em 5 graus
+    for (int pos = anguloAtual; pos >= anguloDestino; pos -= tamanhoDoPasso) {
       motorTranca.write(pos);
-      vTaskDelay(pdMS_TO_TICKS(5));
+      vTaskDelay(pdMS_TO_TICKS(15));
     }
+    motorTranca.write(anguloDestino);
   }
 }
 
